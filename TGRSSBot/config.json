@@ -4,5 +4,29 @@
   "Cycletime": 1,
   "Debug": false,
   "ProxyURL": "",
-  "Pushinfo": ""
+  "Pushinfo": "",
+  "AI": {
+    "enabled": true,
+    "provider": "openai",
+    "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-3.5-turbo",
+    "proxy_url": "",
+    "max_tokens": 1000,
+    "temperature": 0.3,
+    "features": {
+      "translation": {
+        "enabled": true,
+        "default_target": "zh-CN",
+        "supported_langs": ["zh-CN", "en", "ja", "ko", "es", "fr", "de", "ru"]
+      },
+      "summarization": {
+        "enabled": true,
+        "max_length": 200,
+        "min_length": 300
+      },
+      "auto_translate": false,
+      "auto_summarize": false
+    }
+  }
 }

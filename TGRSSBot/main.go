@@ -23,12 +23,48 @@ import (
 // Config 应用配置结构体
 // 从config.json文件中加载配置信息
 type Config struct {
-	BotToken  string `json:"BotToken"`  // Telegram Bot API令牌
-	ADMINIDS  int64  `json:"ADMINIDS"`  // 管理员ID，逗号分隔
-	Cycletime int    `json:"Cycletime"` // RSS检查周期(秒)
-	Debug     bool   `json:"Debug"`     // 是否开启调试模式
-	ProxyURL  string `json:"ProxyURL"`  // 代理服务器URL
-	Pushinfo  string `json:"Pushinfo"`  // 推送信息配置
+	BotToken  string    `json:"BotToken"`  // Telegram Bot API令牌
+	ADMINIDS  int64     `json:"ADMINIDS"`  // 管理员ID，逗号分隔
+	Cycletime int       `json:"Cycletime"` // RSS检查周期(秒)
+	Debug     bool      `json:"Debug"`     // 是否开启调试模式
+	ProxyURL  string    `json:"ProxyURL"`  // 代理服务器URL
+	Pushinfo  string    `json:"Pushinfo"`  // 推送信息配置
+	AI        *AIConfig `json:"AI"`        // AI功能配置
+}
+
+// AIConfig AI功能配置结构体
+type AIConfig struct {
+	Enabled     bool                    `json:"enabled"`      // 是否启用AI功能
+	Provider    string                  `json:"provider"`     // AI服务提供商
+	APIKey      string                  `json:"api_key"`      // API密钥
+	BaseURL     string                  `json:"base_url"`     // API基础URL
+	Model       string                  `json:"model"`        // 使用的模型
+	ProxyURL    string                  `json:"proxy_url"`    // 代理URL
+	MaxTokens   int                     `json:"max_tokens"`   // 最大token数
+	Temperature float32                 `json:"temperature"`  // 温度参数
+	Features    *AIFeatureConfig        `json:"features"`     // 功能配置
+}
+
+// AIFeatureConfig AI功能特性配置
+type AIFeatureConfig struct {
+	Translation     *TranslationConfig     `json:"translation"`     // 翻译配置
+	Summarization   *SummarizationConfig   `json:"summarization"`   // 摘要配置
+	AutoTranslate   bool                   `json:"auto_translate"`  // 自动翻译
+	AutoSummarize   bool                   `json:"auto_summarize"`  // 自动摘要
+}
+
+// TranslationConfig 翻译配置
+type TranslationConfig struct {
+	Enabled        bool     `json:"enabled"`         // 是否启用翻译
+	DefaultTarget  string   `json:"default_target"`  // 默认目标语言
+	SupportedLangs []string `json:"supported_langs"` // 支持的语言列表
+}
+
+// SummarizationConfig 摘要配置
+type SummarizationConfig struct {
+	Enabled   bool `json:"enabled"`    // 是否启用摘要
+	MaxLength int  `json:"max_length"` // 最大摘要长度
+	MinLength int  `json:"min_length"` // 最小内容长度
 }
 
 // Message RSS消息结构体
@@ -1205,6 +1241,37 @@ func initDatabase() error {
 			last_update_time TEXT, -- 最后更新时间
 			latest_title TEXT DEFAULT ''                      -- 最新文章标题
 		)`,
+		"user_ai_preferences": `CREATE TABLE IF NOT EXISTS user_ai_preferences (
+			user_id INTEGER PRIMARY KEY,                      -- 用户ID
+			auto_translate BOOLEAN DEFAULT FALSE,             -- 自动翻译开关
+			auto_summarize BOOLEAN DEFAULT FALSE,             -- 自动摘要开关
+			preferred_lang TEXT DEFAULT 'zh-CN',              -- 首选语言
+			max_summary_length INTEGER DEFAULT 200,           -- 最大摘要长度
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,   -- 创建时间
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP    -- 更新时间
+		)`,
+		"ai_processing_records": `CREATE TABLE IF NOT EXISTS ai_processing_records (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,             -- 记录ID
+			content_hash TEXT UNIQUE,                          -- 内容哈希（用于缓存）
+			content_type TEXT,                                 -- 内容类型：translate/summarize
+			original_content TEXT,                             -- 原始内容
+			processed_content TEXT,                            -- 处理后内容
+			source_lang TEXT,                                 -- 源语言
+			target_lang TEXT,                                 -- 目标语言
+			provider TEXT,                                    -- AI服务提供商
+			model TEXT,                                       -- 使用的模型
+			tokens_used INTEGER,                              -- 使用的token数量
+			processing_time INTEGER,                          -- 处理时间（毫秒）
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP    -- 创建时间
+		)`,
+		"ai_usage_stats": `CREATE TABLE IF NOT EXISTS ai_usage_stats (
+			date TEXT PRIMARY KEY,                            -- 日期 YYYY-MM-DD
+			translate_count INTEGER DEFAULT 0,               -- 翻译次数
+			summarize_count INTEGER DEFAULT 0,               -- 摘要次数
+			total_tokens INTEGER DEFAULT 0,                  -- 总token使用量
+			total_cost REAL DEFAULT 0.0,                     -- 总费用
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP   -- 更新时间
+		)`,
 	}
 
 	// 创建表
@@ -1230,6 +1297,22 @@ func initDatabase() error {
 		{
 			name: "idx_feed_data_update_time",
 			sql:  "CREATE INDEX IF NOT EXISTS idx_feed_data_update_time ON feed_data(last_update_time)",
+		},
+		{
+			name: "idx_ai_processing_records_hash",
+			sql:  "CREATE INDEX IF NOT EXISTS idx_ai_processing_records_hash ON ai_processing_records(content_hash)",
+		},
+		{
+			name: "idx_ai_processing_records_type",
+			sql:  "CREATE INDEX IF NOT EXISTS idx_ai_processing_records_type ON ai_processing_records(content_type)",
+		},
+		{
+			name: "idx_ai_processing_records_created",
+			sql:  "CREATE INDEX IF NOT EXISTS idx_ai_processing_records_created ON ai_processing_records(created_at)",
+		},
+		{
+			name: "idx_ai_usage_stats_date",
+			sql:  "CREATE INDEX IF NOT EXISTS idx_ai_usage_stats_date ON ai_usage_stats(date)",
 		},
 	}
 

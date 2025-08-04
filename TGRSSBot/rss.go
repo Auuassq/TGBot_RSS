@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,168 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mmcdole/gofeed"
 )
+
+// initializeAIService 初始化AI服务
+func initializeAIService() AIService {
+	if globalConfig.AI == nil || !globalConfig.AI.Enabled {
+		return nil
+	}
+
+	// 创建AI服务配置
+	config := &AIServiceConfig{
+		Provider:    globalConfig.AI.Provider,
+		APIKey:      globalConfig.AI.APIKey,
+		BaseURL:     globalConfig.AI.BaseURL,
+		Model:       globalConfig.AI.Model,
+		ProxyURL:    globalConfig.AI.ProxyURL,
+		MaxTokens:   globalConfig.AI.MaxTokens,
+		Temperature: globalConfig.AI.Temperature,
+		Timeout:     30 * time.Second,
+	}
+
+	// 根据提供商创建相应的服务
+	switch strings.ToLower(config.Provider) {
+	case "openai":
+		return NewOpenAIAdapter(config)
+	default:
+		logMessage("warn", fmt.Sprintf("不支持的AI服务提供商: %s", config.Provider))
+		return nil
+	}
+}
+
+// processMessageWithAI 使用AI处理消息
+func processMessageWithAI(ctx context.Context, aiHandler *AIHandler, msg *Message, userPrefs *UserAIPreferences) (*ProcessedMessage, error) {
+	processed := &ProcessedMessage{
+		Original: msg,
+		HasAI:    false,
+	}
+
+	// 准备内容文本用于AI处理（去掉HTML标签）
+	content := cleanHTMLContent(msg.Title + " " + msg.Description)
+	
+	// 如果内容太短，不进行AI处理
+	if len(content) < 50 {
+		return processed, nil
+	}
+
+	var hasAIProcessing bool
+
+	// 处理翻译
+	if userPrefs.AutoTranslate && globalConfig.AI.Features.Translation.Enabled {
+		if translateResult, err := aiHandler.HandleTranslateRequest(ctx, content, "", userPrefs.PreferredLang); err == nil {
+			processed.Translated = translateResult
+			hasAIProcessing = true
+			logMessage("debug", "AI翻译完成")
+		} else {
+			logMessage("warn", fmt.Sprintf("AI翻译失败: %v", err))
+		}
+	}
+
+	// 处理摘要
+	if userPrefs.AutoSummarize && globalConfig.AI.Features.Summarization.Enabled {
+		maxLength := userPrefs.MaxSummaryLength
+		if maxLength == 0 {
+			maxLength = globalConfig.AI.Features.Summarization.MaxLength
+		}
+		minLength := globalConfig.AI.Features.Summarization.MinLength
+
+		if summaryResult, err := aiHandler.HandleSummarizeRequest(ctx, content, maxLength, minLength); err == nil {
+			processed.Summary = summaryResult
+			hasAIProcessing = true
+			logMessage("debug", "AI摘要完成")
+		} else {
+			logMessage("warn", fmt.Sprintf("AI摘要失败: %v", err))
+		}
+	}
+
+	processed.HasAI = hasAIProcessing
+	return processed, nil
+}
+
+// sendProcessedMessage 发送处理后的消息
+func sendProcessedMessage(userID int64, sub Subscription, processedMsg *ProcessedMessage, formattedKeywords string) {
+	msg := processedMsg.Original
+	formattedDate := msg.PubDate.In(time.FixedZone("CST", 8*60*60)).Format("2006-01-02 15:04:05")
+	
+	var htmlMessage string
+	
+	if sub.Channel == 1 {
+		// 频道模式：显示完整内容
+		imageURL := extractImageURL(msg.Description)
+		
+		if processedMsg.HasAI {
+			// 使用AI处理后的格式
+			htmlMessage = formatAIEnhancedMessage(sub.Name, formattedKeywords, formattedDate, processedMsg)
+		} else {
+			// 使用原始格式
+			cleanDescription := cleanHTMLContent(msg.Description)
+			htmlMessage = fmt.Sprintf("👋 %s: %s\n🕒 %s\n%s\n", sub.Name, formattedKeywords, formattedDate, cleanDescription)
+		}
+		
+		// 根据是否有图片决定发送方式
+		if imageURL != "" {
+			go sendPhotoMessage(userID, imageURL, htmlMessage)
+		} else {
+			go sendHTMLMessage(userID, htmlMessage)
+		}
+	} else {
+		// 链接模式：显示标题和链接
+		htmlMessage = fmt.Sprintf("📌 %s\n🔖 关键词: %s\n🕒 %s", msg.Title, formattedKeywords, formattedDate)
+		
+		if processedMsg.HasAI {
+			// 添加AI处理结果
+			if processedMsg.Translated != nil {
+				htmlMessage += fmt.Sprintf("\n🌐 翻译: %s", processedMsg.Translated.TranslatedText)
+			}
+			if processedMsg.Summary != nil {
+				htmlMessage += fmt.Sprintf("\n📄 摘要: %s", processedMsg.Summary.SummaryText)
+			}
+		}
+		
+		htmlMessage += fmt.Sprintf("\n🔗 %s", msg.Link)
+		go sendHTMLMessage(userID, htmlMessage)
+	}
+}
+
+// formatAIEnhancedMessage 格式化AI增强的消息
+func formatAIEnhancedMessage(sourceName, formattedKeywords, formattedDate string, processedMsg *ProcessedMessage) string {
+	var result strings.Builder
+	
+	// 头部信息
+	result.WriteString(fmt.Sprintf("👋 %s: %s\n🕒 %s\n\n", sourceName, formattedKeywords, formattedDate))
+	
+	// AI处理结果
+	if processedMsg.Translated != nil {
+		result.WriteString("🌐 <b>翻译</b>：\n")
+		result.WriteString(processedMsg.Translated.TranslatedText)
+		result.WriteString("\n\n")
+	}
+	
+	if processedMsg.Summary != nil {
+		result.WriteString("📄 <b>摘要</b>：\n")
+		result.WriteString(processedMsg.Summary.SummaryText)
+		result.WriteString("\n\n")
+	}
+	
+	// 原文（如果有AI处理则折叠显示）
+	if processedMsg.HasAI && processedMsg.Original.Description != "" {
+		result.WriteString("📝 <b>原文</b>：\n")
+		originalText := cleanHTMLContent(processedMsg.Original.Description)
+		// 限制原文显示长度
+		if len(originalText) > 300 {
+			originalText = originalText[:300] + "..."
+		}
+		result.WriteString(originalText)
+		result.WriteString("\n")
+	} else if !processedMsg.HasAI {
+		// 没有AI处理时显示完整原文
+		cleanDescription := cleanHTMLContent(processedMsg.Original.Description)
+		result.WriteString(cleanDescription)
+		result.WriteString("\n")
+	}
+	
+	return result.String()
+}
 
 // 获取所有订阅
 func getSubscriptions(db *sql.DB) ([]Subscription, error) {
@@ -284,6 +447,14 @@ func processSubscription(db *sql.DB, sub Subscription, userKeywords map[int64][]
 		return
 	}
 
+	// 初始化AI处理器（如果启用）
+	var aiHandler *AIHandler
+	if globalConfig.AI != nil && globalConfig.AI.Enabled {
+		if aiService := initializeAIService(); aiService != nil {
+			aiHandler = NewAIHandler(aiService, db)
+		}
+	}
+
 	// 处理推送
 	pushCount := 0
 	for _, msg := range messages {
@@ -297,11 +468,47 @@ func processSubscription(db *sql.DB, sub Subscription, userKeywords map[int64][]
 			// 如果匹配到关键词或是全量推送，则发送消息
 			if len(matchedKeywords) > 0 {
 				pushCount++
-				//if len(matchedKeywords) > 0 {
 				logMessage("debug", fmt.Sprintf("关键词[%s]匹配 推送给用户 %d: %s",
 					strings.Join(matchedKeywords, ", "), userID, msg.Title))
-				// 这里添加实际的推送逻辑
+				
 				recordPush(sub.Name)
+				
+				// 获取用户AI偏好设置
+				var processedMsg *ProcessedMessage
+				if aiHandler != nil {
+					userPrefs, err := GetUserAIPreferences(userID)
+					if err != nil {
+						logMessage("warn", fmt.Sprintf("获取用户AI偏好失败: %v", err))
+						// 使用默认偏好
+						userPrefs = &UserAIPreferences{
+							UserID:           userID,
+							AutoTranslate:    false,
+							AutoSummarize:    false,
+							PreferredLang:    "zh-CN",
+							MaxSummaryLength: 200,
+						}
+					}
+					
+					// 使用AI处理消息（如果用户启用了AI功能）
+					if userPrefs.AutoTranslate || userPrefs.AutoSummarize {
+						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+						defer cancel()
+						
+						processedMsg, err = processMessageWithAI(ctx, aiHandler, &msg, userPrefs)
+						if err != nil {
+							logMessage("warn", fmt.Sprintf("AI处理消息失败: %v", err))
+							// 继续使用原始消息
+							processedMsg = &ProcessedMessage{Original: &msg, HasAI: false}
+						}
+					} else {
+						// 用户未启用AI功能，使用原始消息
+						processedMsg = &ProcessedMessage{Original: &msg, HasAI: false}
+					}
+				} else {
+					// AI未启用，使用原始消息
+					processedMsg = &ProcessedMessage{Original: &msg, HasAI: false}
+				}
+				
 				// 格式化关键词列表，每个关键词单独用code标签包裹
 				var formattedKeywords string
 				if len(matchedKeywords) > 0 {
@@ -311,36 +518,20 @@ func processSubscription(db *sql.DB, sub Subscription, userKeywords map[int64][]
 					}
 					formattedKeywords = strings.Join(keywordCodes, " ")
 				}
-				title := msg.Title
-				description := msg.Description
-				link := msg.Link
-
-				// 提取图片URL并清理HTML内容
-
-				// 格式化时间
-				formattedDate := msg.PubDate.In(time.FixedZone("CST", 8*60*60)).Format("2006-01-02 15:04:05")
-				var otherpush string
-				// 构造HTML消息
-				var htmlMessage string
-				if sub.Channel == 1 {
-					imageURL := extractImageURL(description)
-					cleanDescription := cleanHTMLContent(description)
-					htmlMessage = fmt.Sprintf("👋 %s: %s\n🕒 %s\n%s\n", sub.Name, formattedKeywords, formattedDate, cleanDescription)
-					otherpush = fmt.Sprintf("👋 %s\n🕒 %s\n%s", sub.Name, formattedDate, cleanDescription)
-					// 根据是否有图片决定发送方式
-					if imageURL != "" {
-						// 如果找到图片，发送图片消息
-						go sendPhotoMessage(userID, imageURL, htmlMessage)
-					} else {
-						// 如果没有图片，发送普通HTML消息
-						go sendHTMLMessage(userID, htmlMessage)
-					}
-				} else {
-					htmlMessage = fmt.Sprintf("📌 %s\n🔖 关键词: %s\n🕒 %s\n🔗 %s", title, formattedKeywords, formattedDate, link)
-					otherpush = fmt.Sprintf("📌 %s\n🕒 %s\n🔗 %s", title, formattedDate, link)
-					go sendHTMLMessage(userID, htmlMessage)
-				}
+				
+				// 构造和发送消息
+				sendProcessedMessage(userID, sub, processedMsg, formattedKeywords)
+				
+				// 给管理员发送简化版本
 				if userID == globalConfig.ADMINIDS {
+					formattedDate := msg.PubDate.In(time.FixedZone("CST", 8*60*60)).Format("2006-01-02 15:04:05")
+					var otherpush string
+					if sub.Channel == 1 {
+						cleanDescription := cleanHTMLContent(msg.Description)
+						otherpush = fmt.Sprintf("👋 %s\n🕒 %s\n%s", sub.Name, formattedDate, cleanDescription)
+					} else {
+						otherpush = fmt.Sprintf("📌 %s\n🕒 %s\n🔗 %s", msg.Title, formattedDate, msg.Link)
+					}
 					go sendother(otherpush)
 				}
 			}
